@@ -296,6 +296,7 @@ fn create_driver_output(
             pre_type_delay_ms,
             config.auto_submit,
             config.append_text.clone(),
+            config.shift_enter_newlines,
         )),
         OutputDriver::Clipboard => {
             Box::new(clipboard::ClipboardOutput::new(config.append_text.clone()))

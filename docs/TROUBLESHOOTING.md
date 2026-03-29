@@ -301,6 +301,44 @@ aplay test.wav
 max_duration_secs = 120  # 2 minutes
 ```
 
+### "Microphone silent" notification, and the recording stops on its own
+
+**Cause:** The dead-input guard found no sound at all in the first 1.5 s of
+the capture, which is what a microphone that is off, muted in hardware, or
+asleep sends. The notification names the audio source that stayed silent.
+Most often a wireless receiver or USB microphone is powered off and the
+audio server has handed the recording to it anyway.
+
+**Solution:** Switch the microphone on, or pick another source:
+```bash
+pactl get-default-source          # what voxtype recorded from
+pactl list sources short          # what else is available
+pactl set-default-source <name>
+```
+
+If it fires on a microphone that works, its noise floor is below the
+threshold. Lower the threshold (it is in dBFS, so a lower number is
+quieter), or switch the guard off:
+```toml
+[audio.dead_input]
+threshold_dbfs = -110.0
+# enabled = false
+```
+
+### A dictation produces no text and nothing says why
+
+**Cause:** Dead input that the guard does not catch: some capture hardware
+sends a DC offset with slow drift rather than silence, and that cannot be
+told apart from a very quiet live microphone.
+
+**Solution:** Check what the source is actually sending:
+```bash
+pw-record --rate=16000 --channels=1 --format=s16 --target="$(pactl get-default-source)" test.wav
+# speak, then stop with Ctrl-C
+aplay test.wav
+```
+Silence on playback means the source, not voxtype, is the problem.
+
 ---
 
 ## Transcription Issues
