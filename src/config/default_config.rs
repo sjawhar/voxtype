@@ -66,6 +66,23 @@ max_duration_secs = 60
 # duck_media = false
 # duck_media_volume_percent = 70
 
+# [audio.dead_input]
+# Stop a recording whose microphone delivers no sound at all (a device that
+# is off, muted in hardware, or asleep still streams: digital silence or a
+# bare DC offset). Without this, such a recording transcribes to nothing and
+# the dictation is lost without a word. On a verdict of dead, the recording
+# stops, the error cue plays and a notification names the audio source.
+# enabled = true
+#
+# How long to listen for sound before giving up, in milliseconds
+# window_ms = 1500
+#
+# Level a 100 ms frame must reach, in dBFS, for the input to count as alive.
+# Measured after a 150 Hz high-pass, so a DC offset adds nothing to it. The
+# default sits about 12 dB below the quietest real recording in a corpus of
+# 22,811 dictations, whose dead recordings carried no energy at all.
+# threshold_dbfs = -100.0
+
 # [audio.feedback]
 # Enable audio feedback sounds (beeps when recording starts/stops)
 # enabled = true
