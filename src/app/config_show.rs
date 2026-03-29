@@ -68,6 +68,14 @@ pub(crate) async fn show_config(config: &config::Config) -> anyhow::Result<()> {
     println!("  sample_rate = {}", config.audio.sample_rate);
     println!("  max_duration_secs = {}", config.audio.max_duration_secs);
 
+    println!("\n[audio.dead_input]");
+    println!("  enabled = {}", config.audio.dead_input.enabled);
+    println!("  window_ms = {}", config.audio.dead_input.window_ms);
+    println!(
+        "  threshold_dbfs = {}",
+        config.audio.dead_input.threshold_dbfs
+    );
+
     println!("\n[audio.feedback]");
     println!("  enabled = {}", config.audio.feedback.enabled);
     println!("  theme = {:?}", config.audio.feedback.theme);

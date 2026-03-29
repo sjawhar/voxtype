@@ -19,12 +19,13 @@ mod parse;
 mod profile;
 mod root;
 mod status;
+mod streaming_recovery;
 mod text;
 mod vad;
 mod vocabulary;
 mod whisper;
 
-pub use audio::{AudioConfig, AudioFeedbackConfig};
+pub use audio::{AudioConfig, AudioFeedbackConfig, DeadInputConfig};
 pub use default_config::{default_config_content, DEFAULT_CONFIG};
 pub use engines::{
     CohereConfig, DeepgramConfig, DolphinConfig, MoonshineConfig, OmnilingualConfig,
@@ -45,6 +46,7 @@ pub use output::{
 pub use profile::{PostProcessConfig, Profile};
 pub use root::Config;
 pub use status::{ResolvedIcons, StatusConfig, StatusIconOverrides};
+pub use streaming_recovery::StreamingRecoveryConfig;
 pub use text::TextConfig;
 pub use vad::{VadBackend, VadConfig};
 pub use vocabulary::VocabularyConfig;
