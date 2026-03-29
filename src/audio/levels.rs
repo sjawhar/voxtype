@@ -51,6 +51,7 @@
 //! work as if the daemon had just started. That's an acceptable trade-off
 //! since the alternative is a permanently broken socket.
 
+use super::input_guard::DeadInputGuard;
 use crate::config::Config;
 use std::io;
 use std::path::PathBuf;
@@ -540,31 +541,24 @@ impl Default for LevelBucketer {
     }
 }
 
-/// Spawn a forwarder task that reads from an `mpsc::Receiver<Vec<f32>>`
-/// (the chunk stream from `AudioCapture::start()`), buckets the samples
-/// into 100 Hz frames, and publishes them to the supplied `FrameSink`.
+/// Spawn the pump that drains the chunk stream from
+/// `AudioCapture::start()` and feeds everything that wants a copy of it:
+///
+/// - `sink`: buckets the samples into 100 Hz frames for the OSD visualizer.
+/// - `streaming_tx`: hands each chunk to a streaming transcription backend.
+///   Each chunk is `try_send`'d; a failure (closed receiver, full bounded
+///   channel) is logged at trace and never blocks the pump.
+/// - `guard`: watches the opening of the capture for a dead input device
+///   and reports once, then stops costing anything.
 ///
 /// The task ends when the input receiver is closed. This is the correct
-/// signal for "recording stopped".
-pub fn spawn_emitter(
-    chunk_rx: mpsc::Receiver<Vec<f32>>,
-    sink: FrameSink,
-) -> tokio::task::JoinHandle<()> {
-    spawn_emitter_with_streaming_tap(chunk_rx, sink, None)
-}
-
-/// Like [`spawn_emitter`] but also forwards every chunk to an optional
-/// `streaming_tx`, used by the streaming transcription pipeline to feed
-/// audio into a backend without disturbing the OSD level emitter.
-///
-/// When `streaming_tx` is `Some`, each chunk is cloned and `try_send`'d to
-/// it. Failure to send (closed receiver, full bounded channel) is logged at
-/// trace and never blocks the level emitter. When `streaming_tx` is `None`,
-/// behavior is identical to [`spawn_emitter`].
-pub fn spawn_emitter_with_streaming_tap(
+/// signal for "recording stopped". It is spawned even when every consumer
+/// is `None`, so that the capture's chunk channel keeps draining.
+pub fn spawn_chunk_pump(
     mut chunk_rx: mpsc::Receiver<Vec<f32>>,
-    sink: FrameSink,
+    sink: Option<FrameSink>,
     streaming_tx: Option<mpsc::Sender<Vec<f32>>>,
+    mut guard: Option<DeadInputGuard>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut bucketer = LevelBucketer::new();
@@ -573,19 +567,27 @@ pub fn spawn_emitter_with_streaming_tap(
         let mut out: Vec<AudioFrame> = Vec::with_capacity(8);
 
         while let Some(chunk) = chunk_rx.recv().await {
-            out.clear();
-            bucketer.push(&chunk, &mut out);
-            for frame in out.drain(..) {
-                sink.publish(frame);
+            if let Some(g) = guard.as_mut() {
+                if g.observe(&chunk) {
+                    guard = None;
+                }
             }
 
-            if let Some(ref tx) = streaming_tx {
+            if let Some(sink) = &sink {
+                out.clear();
+                bucketer.push(&chunk, &mut out);
+                for frame in out.drain(..) {
+                    sink.publish(frame);
+                }
+            }
+
+            if let Some(tx) = &streaming_tx {
                 if let Err(e) = tx.try_send(chunk) {
                     tracing::trace!("streaming sample tap try_send failed: {}", e);
                 }
             }
         }
-        tracing::trace!("Audio level emitter task ended");
+        tracing::trace!("Audio chunk pump task ended");
     })
 }
 
