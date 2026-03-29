@@ -5,7 +5,7 @@
 
 use crate::audio::feedback::{AudioFeedback, SoundEvent};
 use crate::audio::{self, AudioCapture};
-use crate::config::{ActivationMode, Config, FileMode, OutputMode};
+use crate::config::{ActivationMode, Config, FileMode, OutputConfig, OutputMode};
 use crate::eager::{self, EagerConfig};
 use crate::error::Result;
 #[cfg(target_os = "linux")]
@@ -254,6 +254,27 @@ fn read_output_mode_override() -> Option<OutputOverride> {
 fn cleanup_output_mode_override() {
     let override_file = Config::runtime_dir().join("output_mode_override");
     let _ = std::fs::remove_file(&override_file);
+}
+
+/// Fold a per-recording output override into the output configuration a
+/// session's chain is built from.
+///
+/// `--file` and `--file=PATH` both land as `mode = File`: with a path they
+/// set it, without one they keep the configured `file_path`, which is what
+/// `OutputMode::File` means to the chain factory.
+fn apply_output_override(base: &OutputConfig, over: Option<OutputOverride>) -> OutputConfig {
+    let mut config = base.clone();
+    match over {
+        Some(OutputOverride::FileWithPath(path)) => {
+            config.mode = OutputMode::File;
+            config.file_path = Some(path);
+        }
+        Some(OutputOverride::Mode(mode)) => {
+            config.mode = mode;
+        }
+        None => {}
+    }
+    config
 }
 
 /// Read and consume the profile override file
@@ -611,8 +632,15 @@ pub struct Daemon {
     last_dictation: Option<(String, Instant)>,
     /// Audio level broadcaster for the OSD (None when disabled or bind failed)
     level_hub: Option<audio::levels::LevelHub>,
-    /// Active per-recording level emitter task; aborted when recording stops
+    /// Active per-recording chunk pump task; aborted when recording stops
     level_emitter_task: Option<tokio::task::JoinHandle<()>>,
+    /// Receiver for the dead-input guard's single report. Armed when a
+    /// capture starts; the main loop selects on it while it is `Some`.
+    dead_input_rx: Option<tokio::sync::mpsc::Receiver<audio::input_guard::DeadInputReport>>,
+    /// True while the running streaming session delivers to a file rather
+    /// than to the keyboard. Nothing may reach the cursor then: no partial
+    /// text, no backspaces for a revision, none for a cancel.
+    streaming_to_file: bool,
     /// Synthetic zero-level publisher that keeps the OSD visible while a
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
@@ -755,9 +783,11 @@ impl Daemon {
             last_dictation: None,
             level_hub: None,
             level_emitter_task: None,
+            streaming_to_file: false,
             streaming_drain_pump: None,
             osd_supervisor_task: None,
             model_manager: None,
+            dead_input_rx: None,
             model_load_task: None,
             whisper_prepare_task: None,
             transcription_task: None,
@@ -824,26 +854,28 @@ impl Daemon {
         }
     }
 
-    /// Start a push-to-talk audio capture and (if enabled) a level emitter.
+    /// Start a push-to-talk audio capture, the chunk pump that drains it,
+    /// and (if enabled) the level emitter and the dead-input guard.
     ///
     /// Returns the capture handle on success. The chunk receiver from the
     /// capture is plumbed into the level hub so the OSD sees audio frames
-    /// at 100 Hz during recording. The emitter task is tracked so it can
+    /// at 100 Hz during recording. The pump task is tracked so it can
     /// be cleanly aborted when recording stops.
     async fn start_recording_capture(&mut self) -> std::result::Result<Box<dyn AudioCapture>, ()> {
         match audio::create_capture(&self.config.audio) {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
-                    if let Some(hub) = &self.level_hub {
-                        // Cancel any prior emitter (defensive; should be idle).
-                        if let Some(handle) = self.level_emitter_task.take() {
-                            handle.abort();
-                        }
-                        let handle = audio::levels::spawn_emitter(chunk_rx, hub.frame_sink());
-                        self.level_emitter_task = Some(handle);
+                    // Cancel any prior pump (defensive; should be idle).
+                    if let Some(handle) = self.level_emitter_task.take() {
+                        handle.abort();
                     }
-                    // If level_hub is None we still return Ok; the chunk_rx
-                    // is dropped here, matching previous behaviour.
+                    let handle = audio::levels::spawn_chunk_pump(
+                        chunk_rx,
+                        self.level_hub.as_ref().map(|hub| hub.frame_sink()),
+                        None,
+                        self.start_dead_input_guard(),
+                    );
+                    self.level_emitter_task = Some(handle);
                     Ok(capture)
                 }
                 Err(e) => {
@@ -858,6 +890,23 @@ impl Daemon {
                 Err(())
             }
         }
+    }
+
+    /// Arm the dead-input guard for a capture that is about to start, and
+    /// park its receiver where the main loop can select on it. Returns
+    /// `None` when the guard is switched off, which leaves the chunk pump
+    /// with nothing to do for it.
+    fn start_dead_input_guard(&mut self) -> Option<audio::input_guard::DeadInputGuard> {
+        self.dead_input_rx = None;
+        if !self.config.audio.dead_input.enabled {
+            return None;
+        }
+        let (guard, rx) = audio::input_guard::DeadInputGuard::new(
+            self.config.audio.sample_rate,
+            &self.config.audio.dead_input,
+        );
+        self.dead_input_rx = Some(rx);
+        Some(guard)
     }
 
     /// Stop the level emitter task (if running). The capture's chunk
@@ -922,7 +971,16 @@ impl Daemon {
         *streaming_session = Some(StreamingSession::with_buffer_only(
             self.config.output.streaming_buffer_output,
         ));
-        *streaming_chain = Some(output::create_output_chain(&self.config.output));
+        // Per-recording output override (`voxtype record start --clipboard`,
+        // `--file=PATH`, ...). The batch path reads this when it has a
+        // finished transcript; a streaming session has no such moment, so it
+        // resolves the override here, into the config its output chain is
+        // built from. Without this the session types the transcript wherever
+        // the cursor is, whatever the user asked for.
+        let output_config = apply_output_override(&self.config.output, read_output_mode_override());
+        self.streaming_to_file =
+            output_config.mode == OutputMode::File && output_config.file_path.is_some();
+        *streaming_chain = Some(output::create_output_chain(&output_config));
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
             model_override,
@@ -1058,6 +1116,17 @@ impl Daemon {
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        self.streaming_to_file = false;
+
+        // Per-recording overrides last exactly one recording. The cancel and
+        // batch paths clear them; without this the sentinels a streaming
+        // session left behind would steer the next one.
+        cleanup_output_mode_override();
+        cleanup_model_override();
+        cleanup_profile_override();
+        cleanup_bool_override("auto_submit");
+        cleanup_bool_override("shift_enter");
+        cleanup_bool_override("smart_auto_submit");
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -1072,18 +1141,17 @@ impl Daemon {
         self.update_state("idle");
     }
 
-    /// Cancel an active streaming session: signal the backend, drop capture,
-    /// rewind any typed text, and reset to idle (with cancel feedback +
-    /// notification).
-    #[allow(clippy::too_many_arguments)]
-    async fn cancel_streaming_to_idle(
+    /// Tear an active streaming session down to idle: signal the backend,
+    /// drop the capture, rewind any text already typed, and clear the
+    /// per-recording overrides. Plays no cue and sends no notification —
+    /// the caller decides what the user is told and why.
+    async fn teardown_streaming_to_idle(
         &mut self,
         state: &mut State,
         audio_capture: &mut Option<Box<dyn AudioCapture>>,
         streaming_handle: &mut Option<StreamHandle>,
         streaming_session: &mut Option<StreamingSession>,
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
-        notification_body: &str,
     ) {
         self.streaming_stopped_at = None;
         if let Some(h) = streaming_handle.take() {
@@ -1094,7 +1162,13 @@ impl Daemon {
             let _ = c.stop().await;
             self.restore_ducked_media_streams();
         }
-        if let Some(s) = streaming_session.as_mut() {
+        // A file-mode session typed nothing, so a rewind would send
+        // backspaces into whatever window has focus. What it did write stays
+        // in the file; the user asked for a file.
+        if let Some(s) = streaming_session
+            .as_mut()
+            .filter(|_| !self.streaming_to_file)
+        {
             if let Err(e) = s.rewind().await {
                 tracing::warn!("Streaming rewind failed: {}", e);
             }
@@ -1102,6 +1176,7 @@ impl Daemon {
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        self.streaming_to_file = false;
 
         cleanup_output_mode_override();
         cleanup_model_override();
@@ -1113,6 +1188,28 @@ impl Daemon {
         self.resume_media_players();
         *state = State::Idle;
         self.update_state("idle");
+    }
+
+    /// Cancel an active streaming session: tear it down, then tell the user
+    /// it was cancelled (cancel cue + notification).
+    #[allow(clippy::too_many_arguments)]
+    async fn cancel_streaming_to_idle(
+        &mut self,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+        notification_body: &str,
+    ) {
+        self.teardown_streaming_to_idle(
+            state,
+            audio_capture,
+            streaming_handle,
+            streaming_session,
+            streaming_chain,
+        )
+        .await;
         self.play_feedback(SoundEvent::Cancelled);
 
         if let Some(cmd) = &self.config.output.post_output_command {
@@ -1131,6 +1228,61 @@ impl Daemon {
             )
             .await;
         }
+    }
+
+    /// A capture delivered no sound at all: stop it, and say so.
+    ///
+    /// Both recording paths end here. Whatever was captured is discarded
+    /// (there is nothing in it), the error cue plays, and an alert names
+    /// the audio source that stayed silent, because a dictation that
+    /// vanishes without a word is the failure this guard exists to end.
+    async fn abort_recording_dead_input(
+        &mut self,
+        report: audio::input_guard::DeadInputReport,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+    ) {
+        let source = audio::input_guard::source_label(&self.config.audio.device).await;
+        tracing::warn!(
+            source = %source,
+            peak_dbfs = report.peak_dbfs,
+            threshold_dbfs = report.threshold_dbfs,
+            "No audio from the input device; stopping the recording"
+        );
+
+        if state.is_streaming() {
+            self.teardown_streaming_to_idle(
+                state,
+                audio_capture,
+                streaming_handle,
+                streaming_session,
+                streaming_chain,
+            )
+            .await;
+        } else {
+            self.stop_level_emitter();
+            if let Some(mut capture) = audio_capture.take() {
+                let _ = capture.stop().await;
+            }
+            self.restore_ducked_media_streams();
+            self.reset_to_idle(state).await;
+        }
+        self.dead_input_rx = None;
+        self.play_feedback(SoundEvent::Error);
+
+        crate::notification::send_alert(
+            "Microphone silent",
+            &format!(
+                "No sound from \"{}\" in the first {:.1} s, so the recording was stopped. \
+                 Is the microphone powered on and unmuted?",
+                source,
+                report.window_ms as f32 / 1000.0,
+            ),
+        )
+        .await;
     }
 
     /// Start a streaming-mode audio capture.
@@ -1156,23 +1308,12 @@ impl Daemon {
                     if let Some(handle) = self.level_emitter_task.take() {
                         handle.abort();
                     }
-                    let handle = if let Some(hub) = &self.level_hub {
-                        audio::levels::spawn_emitter_with_streaming_tap(
-                            chunk_rx,
-                            hub.frame_sink(),
-                            Some(streaming_tx),
-                        )
-                    } else {
-                        // No OSD: still need to drive chunk_rx → streaming_tx.
-                        tokio::spawn(async move {
-                            let mut rx = chunk_rx;
-                            while let Some(chunk) = rx.recv().await {
-                                if streaming_tx.try_send(chunk).is_err() {
-                                    // Backend slow or gone; drop and keep going.
-                                }
-                            }
-                        })
-                    };
+                    let handle = audio::levels::spawn_chunk_pump(
+                        chunk_rx,
+                        self.level_hub.as_ref().map(|hub| hub.frame_sink()),
+                        Some(streaming_tx),
+                        self.start_dead_input_guard(),
+                    );
                     self.level_emitter_task = Some(handle);
                     Ok((capture, streaming_rx))
                 }
@@ -3677,6 +3818,23 @@ impl Daemon {
                     self.handle_transcription_result(&mut state, result).await;
                 }
 
+                // The capture that is running right now carries no sound.
+                Some(report) = async {
+                    match self.dead_input_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.dead_input_rx.is_some() && state.is_recording() => {
+                    self.abort_recording_dead_input(
+                        report,
+                        &mut state,
+                        &mut audio_capture,
+                        &mut streaming_handle,
+                        &mut streaming_session,
+                        &mut streaming_chain,
+                    ).await;
+                }
+
                 // Streaming event pump (active only while State::Streaming).
                 event = async {
                     match streaming_handle.as_mut() {
@@ -3686,7 +3844,15 @@ impl Daemon {
                 }, if state.is_streaming() && streaming_handle.is_some() => {
                     match event {
                         Some(StreamingEvent::Partial { text, .. }) => {
-                            if let (Some(s), Some(chain)) =
+                            if self.streaming_to_file {
+                                // Delivering to a file: a partial is a guess
+                                // the next Final supersedes, and writing it
+                                // would fragment the transcript. Keep it for
+                                // status only.
+                                if let Some(s) = streaming_session.as_mut() {
+                                    s.observe_partial(text);
+                                }
+                            } else if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
                                 if let Err(e) = s.type_partial_delta(
@@ -3728,6 +3894,12 @@ impl Daemon {
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
+                                // A revision rubs out the partial tail at the
+                                // cursor. Nothing of that tail reached a file
+                                // sink (partials are not written), so there is
+                                // nothing to rub out and a backspace would hit
+                                // whatever window has focus instead.
+                                let backspace = if self.streaming_to_file { 0 } else { backspace };
                                 if let Err(e) = s.replace_and_commit(
                                     chain,
                                     backspace,
@@ -4048,6 +4220,54 @@ mod tests {
         // We can't easily mock Config::runtime_dir(), so we test the file operations
         // directly using the same logic as the functions under test
         f(runtime_dir)
+    }
+
+    #[test]
+    fn file_override_with_a_path_sets_file_mode_and_path() {
+        let base = crate::config::OutputConfig::default();
+        let resolved = apply_output_override(
+            &base,
+            Some(OutputOverride::FileWithPath(PathBuf::from("/tmp/out.txt"))),
+        );
+        assert_eq!(resolved.mode, OutputMode::File);
+        assert_eq!(resolved.file_path, Some(PathBuf::from("/tmp/out.txt")));
+    }
+
+    #[test]
+    fn bare_file_override_keeps_the_configured_path() {
+        let base = crate::config::OutputConfig {
+            file_path: Some(PathBuf::from("/tmp/configured.txt")),
+            ..crate::config::OutputConfig::default()
+        };
+        let resolved = apply_output_override(&base, Some(OutputOverride::Mode(OutputMode::File)));
+        assert_eq!(resolved.mode, OutputMode::File);
+        assert_eq!(
+            resolved.file_path,
+            Some(PathBuf::from("/tmp/configured.txt"))
+        );
+    }
+
+    #[test]
+    fn a_mode_override_replaces_only_the_mode() {
+        let base = crate::config::OutputConfig {
+            mode: OutputMode::Paste,
+            append_text: Some("!".to_string()),
+            ..crate::config::OutputConfig::default()
+        };
+        let resolved =
+            apply_output_override(&base, Some(OutputOverride::Mode(OutputMode::Clipboard)));
+        assert_eq!(resolved.mode, OutputMode::Clipboard);
+        assert_eq!(resolved.append_text, Some("!".to_string()));
+    }
+
+    #[test]
+    fn no_override_leaves_the_configuration_alone() {
+        let base = crate::config::OutputConfig {
+            mode: OutputMode::Paste,
+            ..crate::config::OutputConfig::default()
+        };
+        let resolved = apply_output_override(&base, None);
+        assert_eq!(resolved.mode, OutputMode::Paste);
     }
 
     #[test]

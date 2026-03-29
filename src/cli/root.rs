@@ -253,6 +253,28 @@ pub struct Cli {
     )]
     pub duck_media_volume: Option<u8>,
 
+    /// Stop a recording whose microphone delivers no sound at all
+    #[arg(long, help_heading = "Audio", hide_short_help = true)]
+    pub dead_input_check: bool,
+
+    /// Keep recording even when the microphone delivers no sound
+    #[arg(
+        long,
+        help_heading = "Audio",
+        hide_short_help = true,
+        conflicts_with = "dead_input_check"
+    )]
+    pub no_dead_input_check: bool,
+
+    /// Level a 100 ms frame must reach, in dBFS, for the input to count as alive
+    #[arg(
+        long,
+        value_name = "DBFS",
+        help_heading = "Audio",
+        hide_short_help = true
+    )]
+    pub dead_input_threshold: Option<f32>,
+
     // -- Output (delivery, timing, file output, hooks) --
     /// Force clipboard mode (don't try to type)
     #[arg(long, help_heading = "Output")]

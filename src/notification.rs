@@ -41,6 +41,37 @@ pub async fn send_with_engine(title: &str, body: &str, engine: Option<Transcript
     }
 }
 
+/// Send an alert the user must not miss.
+///
+/// Unlike [`send`], an alert is critical, stays on screen for 15 seconds
+/// and is left in the notification history: it reports something that went
+/// wrong and cost the user work, so it must not be overwritten in place by
+/// the next recording's status notification.
+pub async fn send_alert(title: &str, body: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let result = Command::new("notify-send")
+            .args([
+                "--app-name=Voxtype",
+                "--urgency=critical",
+                "--expire-time=15000",
+                title,
+                body,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        if let Err(e) = result {
+            tracing::debug!("Failed to send alert notification: {}", e);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    send(title, body).await;
+}
+
 /// Send a notification on Linux using notify-send
 #[cfg(target_os = "linux")]
 async fn send_linux(title: &str, body: &str) {
