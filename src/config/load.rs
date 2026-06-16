@@ -1,5 +1,5 @@
 use super::parse::parse_config_with_defaults;
-use super::{Config, LanguageConfig, OutputMode, SonioxConfig, TranscriptionEngine};
+use super::{Config, DeepgramConfig, LanguageConfig, OutputMode, SonioxConfig, TranscriptionEngine};
 use crate::error::VoxtypeError;
 use std::path::{Path, PathBuf};
 
@@ -174,6 +174,18 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
         config
             .soniox
             .get_or_insert_with(SonioxConfig::default)
+            .api_key = Some(key);
+    }
+
+    // Deepgram. Accept VOXTYPE_DEEPGRAM_API_KEY (voxtype convention, used by
+    // the secrets wrapper) first, then the bare DEEPGRAM_API_KEY (Deepgram
+    // SDK convention) as a fallback.
+    if let Ok(key) = std::env::var("VOXTYPE_DEEPGRAM_API_KEY")
+        .or_else(|_| std::env::var("DEEPGRAM_API_KEY"))
+    {
+        config
+            .deepgram
+            .get_or_insert_with(DeepgramConfig::default)
             .api_key = Some(key);
     }
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD") {
