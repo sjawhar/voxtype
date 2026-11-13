@@ -23,7 +23,7 @@ mod text;
 mod vad;
 mod whisper;
 
-pub use audio::{AudioConfig, AudioFeedbackConfig};
+pub use audio::{AudioConfig, AudioFeedbackConfig, DeadInputConfig};
 pub use default_config::{default_config_content, DEFAULT_CONFIG};
 pub use engines::{
     CohereConfig, DolphinConfig, MoonshineConfig, OmnilingualConfig, ParaformerConfig,

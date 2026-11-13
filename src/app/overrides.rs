@@ -191,6 +191,14 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(volume) = cli.duck_media_volume {
         config.audio.duck_media_volume_percent = volume.min(150);
     }
+    apply_bool_override(
+        &mut config.audio.dead_input.enabled,
+        cli.dead_input_check,
+        cli.no_dead_input_check,
+    );
+    if let Some(threshold) = cli.dead_input_threshold {
+        config.audio.dead_input.threshold_dbfs = threshold;
+    }
 
     // Output overrides
     if let Some(ref append_text) = cli.append_text {

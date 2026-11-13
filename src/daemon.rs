@@ -609,8 +609,11 @@ pub struct Daemon {
     last_dictation: Option<(String, Instant)>,
     /// Audio level broadcaster for the OSD (None when disabled or bind failed)
     level_hub: Option<audio::levels::LevelHub>,
-    /// Active per-recording level emitter task; aborted when recording stops
+    /// Active per-recording chunk pump task; aborted when recording stops
     level_emitter_task: Option<tokio::task::JoinHandle<()>>,
+    /// Receiver for the dead-input guard's single report. Armed when a
+    /// capture starts; the main loop selects on it while it is `Some`.
+    dead_input_rx: Option<tokio::sync::mpsc::Receiver<audio::input_guard::DeadInputReport>>,
     /// Synthetic zero-level publisher that keeps the OSD visible while a
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
@@ -750,6 +753,7 @@ impl Daemon {
             streaming_drain_pump: None,
             osd_supervisor_task: None,
             model_manager: None,
+            dead_input_rx: None,
             model_load_task: None,
             whisper_prepare_task: None,
             transcription_task: None,
@@ -816,26 +820,28 @@ impl Daemon {
         }
     }
 
-    /// Start a push-to-talk audio capture and (if enabled) a level emitter.
+    /// Start a push-to-talk audio capture, the chunk pump that drains it,
+    /// and (if enabled) the level emitter and the dead-input guard.
     ///
     /// Returns the capture handle on success. The chunk receiver from the
     /// capture is plumbed into the level hub so the OSD sees audio frames
-    /// at 100 Hz during recording. The emitter task is tracked so it can
+    /// at 100 Hz during recording. The pump task is tracked so it can
     /// be cleanly aborted when recording stops.
     async fn start_recording_capture(&mut self) -> std::result::Result<Box<dyn AudioCapture>, ()> {
         match audio::create_capture(&self.config.audio) {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
-                    if let Some(hub) = &self.level_hub {
-                        // Cancel any prior emitter (defensive; should be idle).
-                        if let Some(handle) = self.level_emitter_task.take() {
-                            handle.abort();
-                        }
-                        let handle = audio::levels::spawn_emitter(chunk_rx, hub.frame_sink());
-                        self.level_emitter_task = Some(handle);
+                    // Cancel any prior pump (defensive; should be idle).
+                    if let Some(handle) = self.level_emitter_task.take() {
+                        handle.abort();
                     }
-                    // If level_hub is None we still return Ok; the chunk_rx
-                    // is dropped here, matching previous behaviour.
+                    let handle = audio::levels::spawn_chunk_pump(
+                        chunk_rx,
+                        self.level_hub.as_ref().map(|hub| hub.frame_sink()),
+                        None,
+                        self.start_dead_input_guard(),
+                    );
+                    self.level_emitter_task = Some(handle);
                     Ok(capture)
                 }
                 Err(e) => {
@@ -850,6 +856,23 @@ impl Daemon {
                 Err(())
             }
         }
+    }
+
+    /// Arm the dead-input guard for a capture that is about to start, and
+    /// park its receiver where the main loop can select on it. Returns
+    /// `None` when the guard is switched off, which leaves the chunk pump
+    /// with nothing to do for it.
+    fn start_dead_input_guard(&mut self) -> Option<audio::input_guard::DeadInputGuard> {
+        self.dead_input_rx = None;
+        if !self.config.audio.dead_input.enabled {
+            return None;
+        }
+        let (guard, rx) = audio::input_guard::DeadInputGuard::new(
+            self.config.audio.sample_rate,
+            &self.config.audio.dead_input,
+        );
+        self.dead_input_rx = Some(rx);
+        Some(guard)
     }
 
     /// Stop the level emitter task (if running). The capture's chunk
@@ -1029,18 +1052,17 @@ impl Daemon {
         self.update_state("idle");
     }
 
-    /// Cancel an active streaming session: signal the backend, drop capture,
-    /// rewind any typed text, and reset to idle (with cancel feedback +
-    /// notification).
-    #[allow(clippy::too_many_arguments)]
-    async fn cancel_streaming_to_idle(
+    /// Tear an active streaming session down to idle: signal the backend,
+    /// drop the capture, rewind any text already typed, and clear the
+    /// per-recording overrides. Plays no cue and sends no notification —
+    /// the caller decides what the user is told and why.
+    async fn teardown_streaming_to_idle(
         &mut self,
         state: &mut State,
         audio_capture: &mut Option<Box<dyn AudioCapture>>,
         streaming_handle: &mut Option<StreamHandle>,
         streaming_session: &mut Option<StreamingSession>,
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
-        notification_body: &str,
     ) {
         if let Some(h) = streaming_handle.take() {
             let _ = h.cancel.send(());
@@ -1069,6 +1091,28 @@ impl Daemon {
         self.resume_media_players();
         *state = State::Idle;
         self.update_state("idle");
+    }
+
+    /// Cancel an active streaming session: tear it down, then tell the user
+    /// it was cancelled (cancel cue + notification).
+    #[allow(clippy::too_many_arguments)]
+    async fn cancel_streaming_to_idle(
+        &mut self,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+        notification_body: &str,
+    ) {
+        self.teardown_streaming_to_idle(
+            state,
+            audio_capture,
+            streaming_handle,
+            streaming_session,
+            streaming_chain,
+        )
+        .await;
         self.play_feedback(SoundEvent::Cancelled);
 
         if let Some(cmd) = &self.config.output.post_output_command {
@@ -1087,6 +1131,61 @@ impl Daemon {
             )
             .await;
         }
+    }
+
+    /// A capture delivered no sound at all: stop it, and say so.
+    ///
+    /// Both recording paths end here. Whatever was captured is discarded
+    /// (there is nothing in it), the error cue plays, and an alert names
+    /// the audio source that stayed silent, because a dictation that
+    /// vanishes without a word is the failure this guard exists to end.
+    async fn abort_recording_dead_input(
+        &mut self,
+        report: audio::input_guard::DeadInputReport,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+    ) {
+        let source = audio::input_guard::source_label(&self.config.audio.device).await;
+        tracing::warn!(
+            source = %source,
+            peak_dbfs = report.peak_dbfs,
+            threshold_dbfs = report.threshold_dbfs,
+            "No audio from the input device; stopping the recording"
+        );
+
+        if state.is_streaming() {
+            self.teardown_streaming_to_idle(
+                state,
+                audio_capture,
+                streaming_handle,
+                streaming_session,
+                streaming_chain,
+            )
+            .await;
+        } else {
+            self.stop_level_emitter();
+            if let Some(mut capture) = audio_capture.take() {
+                let _ = capture.stop().await;
+            }
+            self.restore_ducked_media_streams();
+            self.reset_to_idle(state).await;
+        }
+        self.dead_input_rx = None;
+        self.play_feedback(SoundEvent::Error);
+
+        crate::notification::send_alert(
+            "Microphone silent",
+            &format!(
+                "No sound from \"{}\" in the first {:.1} s, so the recording was stopped. \
+                 Is the microphone powered on and unmuted?",
+                source,
+                report.window_ms as f32 / 1000.0,
+            ),
+        )
+        .await;
     }
 
     /// Start a streaming-mode audio capture.
@@ -1112,23 +1211,12 @@ impl Daemon {
                     if let Some(handle) = self.level_emitter_task.take() {
                         handle.abort();
                     }
-                    let handle = if let Some(hub) = &self.level_hub {
-                        audio::levels::spawn_emitter_with_streaming_tap(
-                            chunk_rx,
-                            hub.frame_sink(),
-                            Some(streaming_tx),
-                        )
-                    } else {
-                        // No OSD: still need to drive chunk_rx → streaming_tx.
-                        tokio::spawn(async move {
-                            let mut rx = chunk_rx;
-                            while let Some(chunk) = rx.recv().await {
-                                if streaming_tx.try_send(chunk).is_err() {
-                                    // Backend slow or gone; drop and keep going.
-                                }
-                            }
-                        })
-                    };
+                    let handle = audio::levels::spawn_chunk_pump(
+                        chunk_rx,
+                        self.level_hub.as_ref().map(|hub| hub.frame_sink()),
+                        Some(streaming_tx),
+                        self.start_dead_input_guard(),
+                    );
                     self.level_emitter_task = Some(handle);
                     Ok((capture, streaming_rx))
                 }
@@ -3603,6 +3691,23 @@ impl Daemon {
                 }, if self.transcription_task.is_some() => {
                     self.transcription_task = None;
                     self.handle_transcription_result(&mut state, result).await;
+                }
+
+                // The capture that is running right now carries no sound.
+                Some(report) = async {
+                    match self.dead_input_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.dead_input_rx.is_some() && state.is_recording() => {
+                    self.abort_recording_dead_input(
+                        report,
+                        &mut state,
+                        &mut audio_capture,
+                        &mut streaming_handle,
+                        &mut streaming_session,
+                        &mut streaming_chain,
+                    ).await;
                 }
 
                 // Streaming event pump (active only while State::Streaming).

@@ -406,6 +406,65 @@ original per-channel volumes are restored when recording stops. Values above
 
 ---
 
+## [audio.dead_input]
+
+Stops a recording whose microphone delivers no sound at all.
+
+A microphone that is switched off, muted in hardware, or asleep still opens
+and still streams. What it sends is digital silence, or a bare DC offset with
+nothing on top of it. Voxtype used to record it to the end and transcribe it
+to an empty string, so the dictation was lost with nothing on screen to say
+so. With this guard on, such a recording stops within the window below, the
+error cue plays, and a notification names the audio source that stayed
+silent.
+
+```toml
+[audio.dead_input]
+enabled = true
+window_ms = 1500
+threshold_dbfs = -100.0
+```
+
+### enabled
+
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+Set to `false` to record regardless of what the device sends. CLI:
+`--dead-input-check` / `--no-dead-input-check`.
+
+### window_ms
+
+**Type:** Integer (milliseconds)
+**Default:** `1500`
+**Required:** No
+
+How long the guard listens before it gives up on the input. The loudest
+100 ms frame of the window decides, so a device that starts with a stretch of
+silence (PipeWire can hand over up to about a second of zeros while a device
+starts up) only delays the verdict. Values below `300` are raised to `300`.
+
+### threshold_dbfs
+
+**Type:** Float (dBFS)
+**Default:** `-100.0`
+**Required:** No
+
+The level a 100 ms frame has to reach for the input to count as alive,
+measured after a 150 Hz high-pass. The high-pass is what makes a DC offset
+count for nothing: a built-in microphone biased at -0.21 full scale reads as
+loud without it, and as what it is, a quiet live microphone, with it.
+
+The default comes from 22,889 recordings of one machine: its 29 dead captures
+carried no energy at all, and the quietest of its 22,811 live captures peaked
+at -88.3 dBFS. Raise the value if a dead microphone of yours produces faint
+noise rather than silence, and check against your own quiet recordings first:
+at -70 dBFS, 57 of those 22,811 live recordings would have been stopped.
+CLI: `--dead-input-threshold <DBFS>`.
+
+---
+
 ## [audio.feedback]
 
 Controls audio feedback sounds (beeps when recording starts/stops).
@@ -3247,6 +3306,9 @@ Any config file setting can be overridden via environment variable. These are ap
 | `VOXTYPE_DUCK_MEDIA` | bool | `audio.duck_media` |
 | `VOXTYPE_DUCK_MEDIA_VOLUME_PERCENT` | integer | `audio.duck_media_volume_percent` |
 | `VOXTYPE_AUDIO_FEEDBACK` | bool | `audio.feedback.enabled` |
+| `VOXTYPE_DEAD_INPUT_DETECTION` | bool | `audio.dead_input.enabled` |
+| `VOXTYPE_DEAD_INPUT_WINDOW_MS` | integer | `audio.dead_input.window_ms` |
+| `VOXTYPE_DEAD_INPUT_THRESHOLD_DBFS` | float | `audio.dead_input.threshold_dbfs` |
 
 **Output:**
 
