@@ -27,7 +27,10 @@ jobs:
   build:
     name: Build CLI
     needs: version
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the runner image moved to a glibc 2.43
+    # toolchain on 2026-11-13 and the binary it produced refused to start on
+    # the laptop that consumes this release (glibc 2.39). 24.04 is 2.39.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
