@@ -5,7 +5,7 @@
 
 use crate::audio::feedback::{AudioFeedback, SoundEvent};
 use crate::audio::{self, AudioCapture};
-use crate::config::{ActivationMode, Config, FileMode, OutputMode};
+use crate::config::{ActivationMode, Config, FileMode, OutputConfig, OutputMode};
 use crate::eager::{self, EagerConfig};
 use crate::error::Result;
 #[cfg(target_os = "linux")]
@@ -254,6 +254,27 @@ fn read_output_mode_override() -> Option<OutputOverride> {
 fn cleanup_output_mode_override() {
     let override_file = Config::runtime_dir().join("output_mode_override");
     let _ = std::fs::remove_file(&override_file);
+}
+
+/// Fold a per-recording output override into the output configuration a
+/// session's chain is built from.
+///
+/// `--file` and `--file=PATH` both land as `mode = File`: with a path they
+/// set it, without one they keep the configured `file_path`, which is what
+/// `OutputMode::File` means to the chain factory.
+fn apply_output_override(base: &OutputConfig, over: Option<OutputOverride>) -> OutputConfig {
+    let mut config = base.clone();
+    match over {
+        Some(OutputOverride::FileWithPath(path)) => {
+            config.mode = OutputMode::File;
+            config.file_path = Some(path);
+        }
+        Some(OutputOverride::Mode(mode)) => {
+            config.mode = mode;
+        }
+        None => {}
+    }
+    config
 }
 
 /// Read and consume the profile override file
@@ -611,6 +632,10 @@ pub struct Daemon {
     level_hub: Option<audio::levels::LevelHub>,
     /// Active per-recording level emitter task; aborted when recording stops
     level_emitter_task: Option<tokio::task::JoinHandle<()>>,
+    /// True while the running streaming session delivers to a file rather
+    /// than to the keyboard. Nothing may reach the cursor then: no partial
+    /// text, no backspaces for a revision, none for a cancel.
+    streaming_to_file: bool,
     /// Synthetic zero-level publisher that keeps the OSD visible while a
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
@@ -747,6 +772,7 @@ impl Daemon {
             last_dictation: None,
             level_hub: None,
             level_emitter_task: None,
+            streaming_to_file: false,
             streaming_drain_pump: None,
             osd_supervisor_task: None,
             model_manager: None,
@@ -912,7 +938,16 @@ impl Daemon {
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
         *streaming_session = Some(StreamingSession::new());
-        *streaming_chain = Some(output::create_output_chain(&self.config.output));
+        // Per-recording output override (`voxtype record start --clipboard`,
+        // `--file=PATH`, ...). The batch path reads this when it has a
+        // finished transcript; a streaming session has no such moment, so it
+        // resolves the override here, into the config its output chain is
+        // built from. Without this the session types the transcript wherever
+        // the cursor is, whatever the user asked for.
+        let output_config = apply_output_override(&self.config.output, read_output_mode_override());
+        self.streaming_to_file =
+            output_config.mode == OutputMode::File && output_config.file_path.is_some();
+        *streaming_chain = Some(output::create_output_chain(&output_config));
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
             model_override,
@@ -1015,6 +1050,17 @@ impl Daemon {
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        self.streaming_to_file = false;
+
+        // Per-recording overrides last exactly one recording. The cancel and
+        // batch paths clear them; without this the sentinels a streaming
+        // session left behind would steer the next one.
+        cleanup_output_mode_override();
+        cleanup_model_override();
+        cleanup_profile_override();
+        cleanup_bool_override("auto_submit");
+        cleanup_bool_override("shift_enter");
+        cleanup_bool_override("smart_auto_submit");
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -1050,7 +1096,13 @@ impl Daemon {
             let _ = c.stop().await;
             self.restore_ducked_media_streams();
         }
-        if let Some(s) = streaming_session.as_mut() {
+        // A file-mode session typed nothing, so a rewind would send
+        // backspaces into whatever window has focus. What it did write stays
+        // in the file; the user asked for a file.
+        if let Some(s) = streaming_session
+            .as_mut()
+            .filter(|_| !self.streaming_to_file)
+        {
             if let Err(e) = s.rewind().await {
                 tracing::warn!("Streaming rewind failed: {}", e);
             }
@@ -1058,6 +1110,7 @@ impl Daemon {
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        self.streaming_to_file = false;
 
         cleanup_output_mode_override();
         cleanup_model_override();
@@ -3614,7 +3667,15 @@ impl Daemon {
                 }, if state.is_streaming() && streaming_handle.is_some() => {
                     match event {
                         Some(StreamingEvent::Partial { text, .. }) => {
-                            if let (Some(s), Some(chain)) =
+                            if self.streaming_to_file {
+                                // Delivering to a file: a partial is a guess
+                                // the next Final supersedes, and writing it
+                                // would fragment the transcript. Keep it for
+                                // status only.
+                                if let Some(s) = streaming_session.as_mut() {
+                                    s.observe_partial(text);
+                                }
+                            } else if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
                                 if let Err(e) = s.type_partial_delta(
@@ -3656,6 +3717,12 @@ impl Daemon {
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
+                                // A revision rubs out the partial tail at the
+                                // cursor. Nothing of that tail reached a file
+                                // sink (partials are not written), so there is
+                                // nothing to rub out and a backspace would hit
+                                // whatever window has focus instead.
+                                let backspace = if self.streaming_to_file { 0 } else { backspace };
                                 if let Err(e) = s.replace_and_commit(
                                     chain,
                                     backspace,
@@ -3974,6 +4041,54 @@ mod tests {
         // We can't easily mock Config::runtime_dir(), so we test the file operations
         // directly using the same logic as the functions under test
         f(runtime_dir)
+    }
+
+    #[test]
+    fn file_override_with_a_path_sets_file_mode_and_path() {
+        let base = crate::config::OutputConfig::default();
+        let resolved = apply_output_override(
+            &base,
+            Some(OutputOverride::FileWithPath(PathBuf::from("/tmp/out.txt"))),
+        );
+        assert_eq!(resolved.mode, OutputMode::File);
+        assert_eq!(resolved.file_path, Some(PathBuf::from("/tmp/out.txt")));
+    }
+
+    #[test]
+    fn bare_file_override_keeps_the_configured_path() {
+        let base = crate::config::OutputConfig {
+            file_path: Some(PathBuf::from("/tmp/configured.txt")),
+            ..crate::config::OutputConfig::default()
+        };
+        let resolved = apply_output_override(&base, Some(OutputOverride::Mode(OutputMode::File)));
+        assert_eq!(resolved.mode, OutputMode::File);
+        assert_eq!(
+            resolved.file_path,
+            Some(PathBuf::from("/tmp/configured.txt"))
+        );
+    }
+
+    #[test]
+    fn a_mode_override_replaces_only_the_mode() {
+        let base = crate::config::OutputConfig {
+            mode: OutputMode::Paste,
+            append_text: Some("!".to_string()),
+            ..crate::config::OutputConfig::default()
+        };
+        let resolved =
+            apply_output_override(&base, Some(OutputOverride::Mode(OutputMode::Clipboard)));
+        assert_eq!(resolved.mode, OutputMode::Clipboard);
+        assert_eq!(resolved.append_text, Some("!".to_string()));
+    }
+
+    #[test]
+    fn no_override_leaves_the_configuration_alone() {
+        let base = crate::config::OutputConfig {
+            mode: OutputMode::Paste,
+            ..crate::config::OutputConfig::default()
+        };
+        let resolved = apply_output_override(&base, None);
+        assert_eq!(resolved.mode, OutputMode::Paste);
     }
 
     #[test]

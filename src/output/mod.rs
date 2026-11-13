@@ -24,6 +24,7 @@ pub mod cgevent;
 pub mod clipboard;
 pub mod dotool;
 pub mod eitype;
+pub mod file;
 // modifier_guard is evdev-based; macOS has its own osascript modifier handling.
 #[cfg(target_os = "linux")]
 pub mod modifier_guard;
@@ -409,16 +410,22 @@ pub fn create_output_chain_with_override(
                 config.restore_clipboard_delay_ms,
             )));
         }
-        crate::config::OutputMode::File => {
-            // File output is handled in the daemon before reaching the output chain.
-            // If we get here, it means mode = "file" but no file_path is configured.
-            tracing::warn!(
-                "Output mode is 'file' but no file_path configured. Falling back to clipboard."
-            );
-            chain.push(Box::new(clipboard::ClipboardOutput::new(
-                config.append_text.clone(),
-            )));
-        }
+        crate::config::OutputMode::File => match &config.file_path {
+            Some(path) => {
+                chain.push(Box::new(file::FileOutput::new(
+                    path.clone(),
+                    config.file_mode.clone(),
+                )));
+            }
+            None => {
+                tracing::warn!(
+                    "Output mode is 'file' but no file_path configured. Falling back to clipboard."
+                );
+                chain.push(Box::new(clipboard::ClipboardOutput::new(
+                    config.append_text.clone(),
+                )));
+            }
+        },
     }
 
     chain
