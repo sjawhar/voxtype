@@ -615,6 +615,13 @@ pub struct Daemon {
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
     streaming_drain_pump: Option<tokio::task::JoinHandle<()>>,
+    /// Every sample of the streaming session that is running, kept so a
+    /// backend that fails or stalls cannot take the dictation with it.
+    streaming_recovery_audio: Vec<f32>,
+    /// When the daemon stops waiting for a stopped session's backend and
+    /// recovers the dictation itself. Armed at the stop, cleared when the
+    /// session ends.
+    streaming_stop_deadline: Option<tokio::time::Instant>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -748,6 +755,8 @@ impl Daemon {
             level_hub: None,
             level_emitter_task: None,
             streaming_drain_pump: None,
+            streaming_recovery_audio: Vec::new(),
+            streaming_stop_deadline: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -912,6 +921,9 @@ impl Daemon {
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
         *streaming_session = Some(StreamingSession::new());
+        // A new session starts with no retained audio and no stop bound.
+        self.streaming_recovery_audio.clear();
+        self.streaming_stop_deadline = None;
         *streaming_chain = Some(output::create_output_chain(&self.config.output));
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
@@ -989,10 +1001,42 @@ impl Daemon {
     async fn stop_streaming_capture(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
         self.cut_streaming_audio();
         self.start_streaming_drain_pump();
+        self.take_capture_for_recovery(audio_capture).await;
+        // From here the backend owns the transcript. Give it a bound: a
+        // backend that never answers must not leave the session open with
+        // nothing to show for the recording.
+        self.arm_streaming_stop_watchdog();
+    }
+
+    /// Stop the capture and keep its samples, so a session that ends with
+    /// no text can still be transcribed.
+    async fn take_capture_for_recovery(
+        &mut self,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+    ) {
         if let Some(mut c) = audio_capture.take() {
-            let _ = c.stop().await;
+            match c.stop().await {
+                Ok(samples) if !samples.is_empty() => self.streaming_recovery_audio = samples,
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Failed to stop audio capture: {}", e),
+            }
             self.restore_ducked_media_streams();
         }
+    }
+
+    fn arm_streaming_stop_watchdog(&mut self) {
+        // The bound runs from the first stop. A second stop while the
+        // backend drains must not push it out again.
+        if self.streaming_stop_deadline.is_none() {
+            self.streaming_stop_deadline =
+                Some(tokio::time::Instant::now() + self.config.streaming_recovery.stop_timeout());
+        }
+    }
+
+    /// True once the stop bound has passed with the session still open.
+    fn streaming_stop_overdue(&self) -> bool {
+        self.streaming_stop_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
     }
 
     async fn end_streaming(
@@ -1003,18 +1047,35 @@ impl Daemon {
         streaming_session: &mut Option<StreamingSession>,
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
     ) {
-        if let Some(mut c) = audio_capture.take() {
-            let _ = c.stop().await;
-            self.restore_ducked_media_streams();
-        }
+        self.take_capture_for_recovery(audio_capture).await;
         if let Some(h) = streaming_handle.take() {
-            // Don't error on join failure; the task may have already
-            // completed. We drop events implicitly here.
-            let _ = h.task.await;
+            // A backend that stalled will not finish on its own, so cancel
+            // and abort rather than await it: `Ended` is its contract, not
+            // a reason for the daemon to wait without a bound. A healthy
+            // session has already delivered its events by this point.
+            let _ = h.cancel.send(());
+            h.task.abort();
         }
         self.stop_streaming_drain_pump();
+        self.streaming_stop_deadline = None;
+
+        let delivered_chars = streaming_session
+            .as_ref()
+            .map(|s| s.typed_chars())
+            .unwrap_or(0);
+        let delivered_text = streaming_session
+            .as_ref()
+            .map(|s| s.finalized_text().trim().to_string())
+            .unwrap_or_default();
         *streaming_session = None;
         *streaming_chain = None;
+
+        if delivered_chars == 0
+            && delivered_text.is_empty()
+            && self.recover_lost_streaming_dictation(state).await
+        {
+            return;
+        }
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -1027,6 +1088,50 @@ impl Daemon {
         self.resume_media_players();
         *state = State::Idle;
         self.update_state("idle");
+    }
+
+    /// The session delivered nothing. Transcribe the samples it recorded
+    /// and hand them to the ordinary output path. Returns `true` when a
+    /// transcription task is now running, so the caller leaves the state
+    /// machine to it.
+    async fn recover_lost_streaming_dictation(&mut self, state: &mut State) -> bool {
+        let samples = std::mem::take(&mut self.streaming_recovery_audio);
+        if !self.config.streaming_recovery.enabled {
+            return false;
+        }
+        let duration = samples.len() as f32 / self.config.audio.sample_rate as f32;
+        if duration < 0.3 {
+            return false;
+        }
+
+        tracing::warn!(
+            seconds = duration,
+            "Streaming session delivered no text; transcribing the recording instead"
+        );
+
+        // Not the engine that just failed: a streaming backend that lost
+        // its socket is the least likely thing to transcribe this audio.
+        // The configured [whisper] backend does not depend on that session.
+        let mut recovery_config = self.config.clone();
+        recovery_config.engine = crate::config::TranscriptionEngine::Whisper;
+        *state = State::Transcribing {
+            audio: samples.clone(),
+        };
+        self.update_state("transcribing");
+        self.transcription_task = Some(tokio::task::spawn_blocking(move || {
+            let transcriber = crate::transcribe::create_transcriber(&recovery_config)?;
+            transcriber.transcribe(&samples)
+        }));
+
+        send_notification(
+            "Dictation Recovered",
+            "The streaming backend delivered nothing, so the recording was transcribed instead.",
+            self.config.output.notification.show_engine_icon,
+            self.config.engine,
+            &self.config.output.notification.urgency,
+        )
+        .await;
+        true
     }
 
     /// Cancel an active streaming session: signal the backend, drop capture,
@@ -3178,6 +3283,27 @@ impl Daemon {
                                 tracing::trace!("Cancel ignored - not recording or transcribing");
                             }
                         }
+                    }
+                }
+
+                // The stop bound: a backend that never ends a stopped
+                // session must not hold the dictation hostage.
+                _ = tokio::time::sleep(Duration::from_millis(200)),
+                    if state.is_streaming() && self.streaming_stop_deadline.is_some() => {
+                    if self.streaming_stop_overdue() {
+                        tracing::warn!(
+                            "Streaming backend did not finish within {}s of the stop; \
+                             ending the session and recovering the recording",
+                            self.config.streaming_recovery.stop_timeout().as_secs()
+                        );
+                        self.streaming_stop_deadline = None;
+                        self.end_streaming(
+                            &mut state,
+                            &mut audio_capture,
+                            &mut streaming_handle,
+                            &mut streaming_session,
+                            &mut streaming_chain,
+                        ).await;
                     }
                 }
 

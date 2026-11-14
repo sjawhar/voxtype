@@ -70,6 +70,11 @@ pub struct Config {
     #[serde(default)]
     pub vad: VadConfig,
 
+    /// What happens when a streaming session ends without delivering the
+    /// dictation: a backend that failed, or one that never answers the stop.
+    #[serde(default)]
+    pub streaming_recovery: crate::config::StreamingRecoveryConfig,
+
     /// Status display configuration (icons for Waybar/tray integrations)
     #[serde(default)]
     pub status: StatusConfig,
@@ -115,6 +120,7 @@ impl Default for Config {
             soniox: None,
             text: TextConfig::default(),
             vad: VadConfig::default(),
+            streaming_recovery: crate::config::StreamingRecoveryConfig::default(),
             status: StatusConfig::default(),
             osd: crate::osd::config::OsdConfig::default(),
             meeting: MeetingConfig::default(),
